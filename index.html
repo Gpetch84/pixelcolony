@@ -1,0 +1,369 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, height=device-height, initial-scale=1.0, user-scalable=no, shrink-to-fit=yes">
+  <title>YamYamPixel</title>
+
+  <!--
+    SDK Игр ВКонтакте. Глобал зовётся vkBridge, но работать надо через
+    vkBridge.default — это UMD-сборка пакета.
+
+    Файл лежит РЯДОМ, в сборке, а не грузится с чужого CDN. Так было до
+    20 октября 2026 (jsdelivr, версия 2.0.8), и так делает рабочий проект
+    заказчика, но правила ВК про рекламу говорят: «Интегрироваться с другими
+    рекламными сетями, а также использовать сторонний код для показа нельзя».
+    Библиотека своя, вкашная, однако брать её с постороннего узла — лишний
+    повод к вопросам, да и лишняя точка отказа: не ответил CDN, и игра осталась
+    без рекламы и без языка. Версия та же 2.0.8, 4 КБ.
+
+    Вся работа с SDK живёт ЗДЕСЬ, а не в мосте. Мост
+    (Assets/Plugins/WebGL/VkBridge.jslib) только зовёт эти функции: SDK подключён
+    страницей, значит страница и разговаривает с ним.
+  -->
+  <script src="vk-bridge.umd.js"></script>
+
+  <style>
+    html, body {
+      margin: 0;
+      padding: 0;
+      width: 100%;
+      height: 100%;
+      overflow: hidden;
+      background: #1a1020;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    #holder {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    /* Игра вертикальная, 9:16. Размер канваса считает скрипт: на широком экране
+       её надо вписать полями, а не растянуть — иначе доска уезжает за край. */
+    #unity-canvas {
+      display: block;
+      background: #1a1020;
+      touch-action: none;
+    }
+
+    #bar {
+      position: absolute;
+      left: 50%;
+      bottom: 18%;
+      width: 40%;
+      height: 8px;
+      transform: translateX(-50%);
+      border-radius: 4px;
+      background: rgba(255, 255, 255, 0.15);
+      overflow: hidden;
+    }
+
+    #bar > div {
+      width: 0;
+      height: 100%;
+      background: #ffc14d;
+      transition: width 0.15s linear;
+    }
+  </style>
+</head>
+<body>
+  <div id="holder">
+    <canvas id="unity-canvas" width="540" height="960" tabindex="-1"></canvas>
+  </div>
+
+  <div id="bar"><div id="bar-full"></div></div>
+
+  <script>
+    var canvas = document.querySelector("#unity-canvas");
+    var bar = document.querySelector("#bar");
+    var barFull = document.querySelector("#bar-full");
+
+    // Вписываем 9:16 в окно целиком. ВК открывает игру в кадре любой пропорции,
+    // в том числе широкой на настольном компьютере.
+    function fit() {
+      var ratio = 540 / 960;
+      var w = window.innerWidth;
+      var h = window.innerHeight;
+
+      if (w / h > ratio) w = Math.floor(h * ratio);
+      else h = Math.floor(w / ratio);
+
+      canvas.style.width = w + "px";
+      canvas.style.height = h + "px";
+    }
+
+    fit();
+    window.addEventListener("resize", fit);
+
+    var buildUrl = "Build";
+    var config = {
+      dataUrl: buildUrl + "/cf900af3ae8b1c489694cdc2a5757a03.data.unityweb",
+      frameworkUrl: buildUrl + "/7c4370fabed823fdea678770f52a49aa.framework.js.unityweb",
+      codeUrl: buildUrl + "/b2595f4168d8992f7f83a158fbb9cc33.wasm.unityweb",
+      streamingAssetsUrl: "StreamingAssets",
+      companyName: "cbycsoft",
+      productName: "YamYamPixel",
+      productVersion: "1.0"
+    };
+
+    var script = document.createElement("script");
+    script.src = buildUrl + "/a20d398e8475df16f93bd172d61c85e2.loader.js";
+
+    script.onload = function () {
+      createUnityInstance(canvas, config, function (progress) {
+        barFull.style.width = (100 * progress) + "%";
+      }).then(function (instance) {
+        // Глобально и без var: мост зовёт SendMessage именно через это имя.
+        window.unityInstance = instance;
+        bar.style.display = "none";
+
+        // Отдать ответы площадки, пришедшие, пока игра была недосягаема.
+        if (typeof window.vkFlushAnswers === "function") window.vkFlushAnswers();
+      }).catch(function (message) {
+        console.error(message);
+      });
+    };
+
+    document.body.appendChild(script);
+  </script>
+
+  <script>
+    // ===== Мост с площадкой =====
+    //
+    // Ответы уходят в игру на объект VkAds, имена методов зашиты в Ads.cs.
+
+    (function () {
+      var ANSWER_OBJECT = "VkAds";
+      var INIT_TIMEOUT = 4000;
+
+      // Как часто перепроверять наличие рекламных материалов. Полминуты —
+      // достаточно редко, чтобы не донимать площадку, и достаточно часто, чтобы
+      // материалы успели подъехать к первому закрытому бонусу: тот появляется
+      // не раньше третьего уровня.
+      var CHECK_EVERY = 30000;
+
+      // Ждущая просьба. Ровно одна: игра не просит второй ролик, пока идёт
+      // первый, — за этим следит Ads.Busy.
+      var pending = null;
+
+      // Ответы, которые пришли раньше, чем игра стала досягаема.
+      //
+      // Мост заводится из Start() первой сцены, а window.unityInstance
+      // присваивается позже — когда загрузчик Unity доведёт свой промис. В этот
+      // зазор попадает ответ SDK об инициализации, а с ним язык площадки и
+      // разрешение показывать рекламу. Потерянный здесь ответ не виден никак:
+      // игра просто навсегда остаётся «без площадки». Поэтому копим и
+      // отдаём, когда игра появится.
+      var queue = [];
+
+      function answer(method, value) {
+        if (!window.unityInstance || !window.unityInstance.SendMessage) {
+          queue.push([method, value || ""]);
+          return;
+        }
+
+        try {
+          window.unityInstance.SendMessage(ANSWER_OBJECT, method, value || "");
+        } catch (error) {
+          console.warn("[ads] не удалось ответить в игру", error);
+        }
+      }
+
+      // Зовётся загрузчиком, как только игра досягаема.
+      window.vkFlushAnswers = function () {
+        var waiting = queue;
+        queue = [];
+
+        for (var i = 0; i < waiting.length; i++) {
+          answer(waiting[i][0], waiting[i][1]);
+        }
+      };
+
+      function bridge() {
+        return (typeof vkBridge !== "undefined" && vkBridge) ? vkBridge.default : null;
+      }
+
+      // Закрыть ждущую просьбу — ровно один раз.
+      function finish(ok) {
+        if (!pending) return;
+
+        var kind = pending;
+        pending = null;
+
+        if (kind === "interstitial") answer("OnFullscreenClosed", "");
+        else answer(ok ? "OnRewardedSuccess" : "OnRewardedFailed", "");
+
+        // После показа SDK сам запрашивает новую порцию материалов, но знать,
+        // приехала ли она, игра должна от нас: иначе кнопка ролика осталась бы
+        // в том состоянии, в каком была до показа.
+        refresh();
+      }
+
+      // Язык даёт площадка, и он известен сразу: лежит в параметрах запуска
+      // страницы, ждать ответа SDK не нужно.
+      function language() {
+        try {
+          var value = new URLSearchParams(window.location.search).get("vk_language");
+          return value || "";
+        } catch (error) {
+          return "";
+        }
+      }
+
+      // Подписка оформляется ОДИН РАЗ за запуск страницы. Вызов bridge.subscribe
+      // внутри показа — распространённая ошибка: обработчики накапливаются, и
+      // после второго ролика ответ приходит дважды.
+      //
+      // РЕКЛАМНЫХ событий здесь нет нарочно, и это не упущение. Документация
+      // метода разводит их с промисом по смыслу: промис даёт «result: true,
+      // если реклама БЫЛА ПОКАЗАНА», а VKWebAppShowNativeAdsResult всего лишь
+      // «сигнализирует, что параметры вызова были корректны и что библиотека
+      // ПЫТАЕТСЯ отобразить рекламу». То есть событие приходит в начале показа
+      // и тоже с result: true. Слушая его, мы выдавали бы награду и снимали
+      // паузу поверх идущего ролика — молча, без следа в логе.
+      function listen(api) {
+        api.subscribe(function (event) {
+          if (!event || !event.detail) return;
+
+          var type = event.detail.type;
+
+          // Окно игры спрятали, не закрыв страницу: игрок ушёл в меню ВК, в
+          // переписку, свернул приложение. Площадка требует, чтобы звук при
+          // этом не продолжал играть, — и это не прихоть: на телефоне иначе
+          // муравьи топают поверх чужого разговора.
+          if (type === "VKWebAppViewHide") {
+            answer("OnViewHidden", "");
+            return;
+          }
+
+          if (type === "VKWebAppViewRestore") {
+            answer("OnViewRestored", "");
+          }
+        });
+      }
+
+      // Спросить площадку, есть ли готовые материалы, и заодно велеть их
+      // подгрузить. Правила требуют этой проверки именно для ролика за награду:
+      // «Если показать кнопку, когда материалов нет, пользователь ничего не
+      // увидит — то есть нажатие на кнопку ни к чему не приведёт».
+      //
+      // Зовётся при запуске, затем по таймеру и после каждого показа. По
+      // таймеру — потому что запрос материалов может не выполниться (слабая
+      // связь, сбой сети), а повторный вызов дёшев: новых материалов он не
+      // просит, пока предзагруженные не показаны.
+      function refresh() {
+        var api = bridge();
+        if (!api) return;
+
+        // Формат reward спрашиваем с тем же use_waterfall, с каким будем
+        // показывать: иначе проверка отвечала бы про другую рекламу.
+        api.send("VKWebAppCheckNativeAds", {
+          ad_format: "reward",
+          use_waterfall: false
+        }).then(function (data) {
+          answer("OnRewardAvailable", (data && data.result) ? "1" : "0");
+        }).catch(function (error) {
+          console.warn("[ads] проверка ролика за награду не удалась", error);
+          answer("OnRewardAvailable", "0");
+        });
+
+        // Межстраничную только предзагружаем: игра о её наличии не спрашивает,
+        // показ идёт по расписанию, а нет материалов — SDK ответит отказом и
+        // игра пойдёт дальше.
+        api.send("VKWebAppCheckNativeAds", { ad_format: "interstitial" })
+           .catch(function () { });
+      }
+
+      function show(kind, format) {
+        var api = bridge();
+
+        if (!api || pending) {
+          // Показывать нечем, а ответить обязаны: игра ждёт и стоит на паузе.
+          if (kind === "interstitial") answer("OnFullscreenClosed", "");
+          else answer("OnRewardedFailed", "");
+          return;
+        }
+
+        pending = kind;
+
+        var request = { ad_format: format };
+
+        // use_waterfall подменяет ролик за награду межстраничной, когда ролика
+        // нет. Для награды это недопустимо: за неоплаченный показ пришло бы
+        // result: true. Для межстраничной подменять нечем, параметр не её.
+        if (format === "reward") request.use_waterfall = false;
+
+        // Ответ берём ТОЛЬКО из промиса: он один говорит про показ, а не про
+        // попытку (см. пояснение у listen). Заодно он привязан к своему вызову
+        // сам, поэтому ни request_id, ни сопоставление по нему не нужны —
+        // и request_id в документированном списке параметров не значится.
+        //
+        // Промис разрешается ровно один раз, так что и двойного ответа быть
+        // не может; finish со своей проверкой pending остаётся ради раннего
+        // отказа выше, когда показывать нечем.
+        api.send("VKWebAppShowNativeAds", request).then(function (data) {
+          finish(!!data && data.result === true);
+        }).catch(function (error) {
+          console.warn("[ads] вызов рекламы упал", error);
+          finish(false);
+        });
+      }
+
+      // ===== То, что зовёт мост =====
+
+      window.vkInit = function () {
+        var api = bridge();
+
+        if (!api) {
+          console.warn("[ads] SDK ВК не загрузился, играем без рекламы");
+          answer("OnSdkFailed", "");
+          return;
+        }
+
+        listen(api);
+
+        // Вне ВК скрипт SDK грузится, но VKWebAppInit не отвечает никогда:
+        // страница не встроена, отвечать некому. Поэтому срок ожидания, а не
+        // ожидание ответа навсегда, — иначе на чужом хостинге и в предпросмотре
+        // игра осталась бы без языка и без разрешения показывать рекламу.
+        var settled = false;
+
+        var timer = setTimeout(function () {
+          if (settled) return;
+          settled = true;
+          console.warn("[ads] ВК не ответил за " + INIT_TIMEOUT + " мс — играем без рекламы");
+          answer("OnSdkFailed", "");
+        }, INIT_TIMEOUT);
+
+        api.send("VKWebAppInit", {}).then(function () {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          answer("OnSdkReady", language());
+
+          refresh();
+          setInterval(refresh, CHECK_EVERY);
+        }).catch(function (error) {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          console.warn("[ads] инициализация SDK не удалась", error);
+          answer("OnSdkFailed", "");
+        });
+      };
+
+      window.vkShowInterstitial = function () {
+        show("interstitial", "interstitial");
+      };
+
+      window.vkShowRewarded = function () {
+        show("rewarded", "reward");
+      };
+    })();
+  </script>
+</body>
+</html>
