@@ -84,10 +84,19 @@
 
     // Вписываем 9:16 в окно целиком. ВК открывает игру в кадре любой пропорции,
     // в том числе широкой на настольном компьютере.
+    //
+    // **Нулевой размер НЕ ставим.** Страница грузится в кадре, и кадр может
+    // ещё не иметь размера: ВК создал его скрытым, вкладку открыли в фоне.
+    // Тогда расчёт давал 0x0, а события `resize` при появлении размера может и
+    // не быть — канвас оставался нулевым навсегда. Выглядит это чёрным экраном
+    // без единой ошибки, и поймано ровно так: на выложенной сборке окно было
+    // 1280x720, а канвас 0x0.
     function fit() {
       var ratio = 540 / 960;
       var w = window.innerWidth;
       var h = window.innerHeight;
+
+      if (w < 1 || h < 1) return;
 
       if (w / h > ratio) w = Math.floor(h * ratio);
       else h = Math.floor(w / ratio);
@@ -96,14 +105,27 @@
       canvas.style.height = h + "px";
     }
 
+    // Сюда же зовёт мост при возврате из скрытия (VKWebAppViewRestore).
+    window.vkFit = fit;
+
     fit();
     window.addEventListener("resize", fit);
 
+    // Размер кадра меняется и БЕЗ события `resize` — наблюдатель ловит это,
+    // когда окно о себе молчит. Он и есть главная страховка; ниже — две
+    // дешёвые на случай, если его в браузере нет.
+    if (typeof ResizeObserver === "function") {
+      new ResizeObserver(fit).observe(document.documentElement);
+    }
+
+    document.addEventListener("visibilitychange", fit);
+    window.addEventListener("pageshow", fit);
+
     var buildUrl = "Build";
     var config = {
-      dataUrl: buildUrl + "/cf900af3ae8b1c489694cdc2a5757a03.data.unityweb",
+      dataUrl: buildUrl + "/480781aad5131e9bc585a64581d0c6ba.data.unityweb",
       frameworkUrl: buildUrl + "/7c4370fabed823fdea678770f52a49aa.framework.js.unityweb",
-      codeUrl: buildUrl + "/b2595f4168d8992f7f83a158fbb9cc33.wasm.unityweb",
+      codeUrl: buildUrl + "/d769ba129d24cf89dd074c3c3c256d34.wasm.unityweb",
       streamingAssetsUrl: "StreamingAssets",
       companyName: "cbycsoft",
       productName: "YamYamPixel",
@@ -111,7 +133,7 @@
     };
 
     var script = document.createElement("script");
-    script.src = buildUrl + "/a20d398e8475df16f93bd172d61c85e2.loader.js";
+    script.src = buildUrl + "/f7dc5e4e60be55a0c09760c2b213b38e.loader.js";
 
     script.onload = function () {
       createUnityInstance(canvas, config, function (progress) {
@@ -242,6 +264,10 @@
 
           if (type === "VKWebAppViewRestore") {
             answer("OnViewRestored", "");
+
+            // Пока окно было спрятано, кадр мог сменить размер — а события
+            // `resize` при возврате может и не прийти.
+            if (typeof window.vkFit === "function") window.vkFit();
           }
         });
       }
